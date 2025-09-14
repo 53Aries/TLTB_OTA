@@ -1,6 +1,8 @@
 // ESP32-S3 Trailer Lighting Test Box (TLTB)
-// Wi-Fi scan/select/password UI, OTA (GitHub), TFT + encoder + KO,
-// Relays with pulse-test + OCP/open/short, INA226, CC1101 RF (learn 6 buttons), buzzer, NVS prefs.
+// Run Status page, interactive OPEN/SHORT popups (Back=Cancel, PUSH=Enable),
+// "Back" wording, Wi-Fi scan/select/password UI, OTA (GitHub),
+// TFT + encoder + Back button, Relays with pulse-test + OCP/open/short,
+// INA226, CC1101 RF (learn 6 buttons), buzzer, NVS prefs.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -42,7 +44,7 @@ static constexpr int PIN_SW_POS8 = 41;
 static constexpr int PIN_ENC_A   = 32;
 static constexpr int PIN_ENC_B   = 33;
 static constexpr int PIN_ENC_BTN = 25;  // encoder PUSH
-static constexpr int PIN_ENC_KO  = 26;  // KO/back/cancel
+static constexpr int PIN_ENC_KO  = 26;  // physical Back button
 
 static constexpr int PIN_RLY_LEFT   = 11;
 static constexpr int PIN_RLY_RIGHT  = 12;
@@ -105,6 +107,110 @@ static inline void relayOn(RelayId r){ if(r>=0&&r<R_COUNT){ digitalWrite(RELAY_P
 static inline void relayOff(RelayId r){ if(r>=0&&r<R_COUNT){ digitalWrite(RELAY_PIN[r],LOW);  relayState[r]=false;} }
 static inline void relayOffAll(){ for(int i=0;i<R_COUNT;i++) relayOff((RelayId)i); }
 
+// ------------------- Name Helpers -------------------
+static const char* relayName(RelayId r){
+  switch(r){
+    case R_LEFT:   return "LEFT";
+    case R_RIGHT:  return "RIGHT";
+    case R_BRAKE:  return "BRAKE";
+    case R_TAIL:   return "TAIL";
+    case R_MARKER: return "MARKER";
+    case R_AUX:    return "AUX";
+    default:       return "NONE";
+  }
+}
+static RelayId currentActiveRelay(){ for(int i=0;i<R_COUNT;i++) if(relayState[i]) return (RelayId)i; return R_NONE; }
+
+// ------------------- Forward declarations used across sections ---
+static int8_t readEncoderStep();
+static bool   readButtonPressed();
+static bool   readKoPressed();               // physical "Back" button
+static void   drawMenu();
+static void   drawStatusPage(bool force=false);
+static void   refreshStatusIfChanged();
+
+// ------------------- UI: Status (Run) page -------------------
+static bool uiInMenu = false;
+static RelayId  _lastShownRelay = R_NONE;
+static bool     _lastShownFlash = false;
+
+static void drawStatusPage(bool force){
+  RelayId act = currentActiveRelay();
+  bool flash = flashMode;
+
+  if (!force && act==_lastShownRelay && flash==_lastShownFlash) return;
+
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.print("TLTB - Run");
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(0, 18);
+  tft.print("Active Relay: ");
+  tft.print(relayName(act));
+
+  tft.setCursor(0, 34);
+  tft.print("Flash: ");
+  tft.print(flash ? "ON" : "OFF");
+
+  // Hint line
+  tft.setCursor(0, 52);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.print("PUSH=Menu   Back=Exit");
+
+  _lastShownRelay = act;
+  _lastShownFlash = flash;
+}
+
+static inline void refreshStatusIfChanged(){
+  if (!uiInMenu) drawStatusPage(false);
+}
+
+// ------------------- Fault choice popup (interactive) -------------------
+enum FaultType { FAULT_OPEN=0, FAULT_SHORT=1 };
+
+// Returns true if user presses PUSH to enable anyway, false if Back to cancel
+static bool showFaultChoicePopup(FaultType ft, RelayId r) {
+  bool wasInMenu = uiInMenu;
+
+  for (;;) {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setCursor(0, 0);
+
+    if (ft == FAULT_OPEN) {
+      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+      tft.print("OPEN detected");
+    } else {
+      tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+      tft.print("SHORT detected");
+    }
+
+    tft.setCursor(0, 20);
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.print("On relay: ");
+    tft.print(relayName(r));
+
+    tft.setCursor(0, 42);
+    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    tft.print("Back = Cancel");
+
+    tft.setCursor(0, 56);
+    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+    tft.print("PUSH = Enable");
+
+    if (readButtonPressed()) {             // PUSH → enable anyway
+      if (wasInMenu) drawMenu(); else drawStatusPage(true);
+      return true;
+    }
+    if (readKoPressed()) {                 // Back → cancel
+      if (wasInMenu) drawMenu(); else drawStatusPage(true);
+      return false;
+    }
+    delay(10);
+  }
+}
+
 // ------------------- INA226 -------------------
 namespace INA226 {
   static uint8_t addr = 0x40;
@@ -166,18 +272,37 @@ static bool pulseTestAndEngage(RelayId rly) {
   if (ia >= FAST_SHORT_A || INA226::overCurrent()) {
     relayOff(rly);
     buzzerAlarm();
-    return false;
+
+    if (showFaultChoicePopup(FAULT_SHORT, rly)) {
+      relayOn(rly);
+      buzzerBeep();
+      refreshStatusIfChanged();
+      return true;
+    } else {
+      refreshStatusIfChanged();
+      return false;
+    }
   }
 
   // Open-circuit detection
   if (ia < OPEN_THRESH_A) {
     relayOff(rly);
     buzzerAlarm();
-    return false;
+
+    if (showFaultChoicePopup(FAULT_OPEN, rly)) {
+      relayOn(rly);
+      buzzerBeep();
+      refreshStatusIfChanged();
+      return true;
+    } else {
+      refreshStatusIfChanged();
+      return false;
+    }
   }
 
   // Normal engage
   buzzerBeep();
+  refreshStatusIfChanged();
   return true;
 }
 
@@ -213,6 +338,7 @@ static void applyRotaryMode(int pos){
       flashTarget=tgt;
     } break;
   }
+  refreshStatusIfChanged();
 }
 
 // ------------------- CC1101: init -------------------
@@ -236,7 +362,7 @@ static uint32_t captureRfHashBlocking(uint32_t arm_ms=5000) {
     int cur = digitalRead(PIN_CC1101_GDO0);
     if (last == HIGH && cur == LOW) break;
     last = cur;
-    if (!digitalRead(PIN_ENC_KO)) return 0; // KO cancels
+    if (!digitalRead(PIN_ENC_KO)) return 0; // Back cancels
     delay(1);
   }
   if (millis() - start >= arm_ms) return 0;
@@ -307,6 +433,7 @@ static void rfService(){
           lastRfRelay = target;
           flashTarget = target;
         }
+        refreshStatusIfChanged();
       } else {
         // Unknown button → short chirp
         buzzerBeep(30);
@@ -324,15 +451,11 @@ static void serviceFlashMode(){
   if (millis()-last > 400) {
     last = millis(); on = !on;
     if (on) relayOn(flashTarget); else relayOff(flashTarget);
+    refreshStatusIfChanged();
   }
 }
 
 // ------------------- Wi-Fi + OTA -------------------
-// --- Forward declarations for encoder/button helpers (defined later) ---
-static int8_t readEncoderStep();
-static bool   readButtonPressed();
-static bool   readKoPressed();
-
 WebServer server(80);
 
 // Connect using saved creds (returns true on success)
@@ -347,7 +470,7 @@ static bool wifiConnectSaved(uint32_t timeout_ms=20000){
   return WiFi.status()==WL_CONNECTED;
 }
 
-// Simple scrollable list UI on TFT. Returns selected index or -1 on cancel (KO).
+// Simple scrollable list UI on TFT. Returns selected index or -1 on cancel (Back).
 static int tftSelectFromList(const String* items, int count, const char* title) {
   if (count <= 0) return -1;
   int idx = 0;
@@ -364,6 +487,11 @@ static int tftSelectFromList(const String* items, int count, const char* title) 
       tft.setCursor(0, 14 + row*12);
       tft.print(items[i]);
     }
+
+    // Back hint
+    tft.setCursor(0, 90);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.print("Back = cancel");
 
     // input
     int8_t step = readEncoderStep();
@@ -413,6 +541,10 @@ static bool tftEnterPassword(char* outPass, size_t outCap, const char* ssid) {
     } else {
       tft.printf(" %s ", keys[cur - baseCount].c_str());
     }
+
+    tft.setCursor(0, 90);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.print("Back = cancel");
 
     // input
     int8_t step = readEncoderStep();
@@ -510,19 +642,7 @@ static esp_err_t runGithubOta(){
   return (updater.update(client, OTA_LATEST_ASSET_URL)==HTTP_UPDATE_OK)?ESP_OK:ESP_FAIL;
 }
 
-// ------------------- Encoder + Menu -------------------
-static bool btn_last=true;
-static int8_t readEncoderStep(){
-  static uint8_t last=0;
-  uint8_t a=digitalRead(PIN_ENC_A), b=digitalRead(PIN_ENC_B), cur=(a<<1)|b;
-  int8_t s=0;
-  if((last==0&&cur==1)||(last==1&&cur==3)||(last==3&&cur==2)||(last==2&&cur==0))s=+1;
-  if((last==0&&cur==2)||(last==2&&cur==3)||(last==3&&cur==1)||(last==1&&cur==0))s=-1;
-  last=cur; return s;
-}
-static bool readButtonPressed(){ bool cur=!digitalRead(PIN_ENC_BTN); bool p=(cur && !btn_last); btn_last=cur; return p; }
-static bool readKoPressed(){ return !digitalRead(PIN_ENC_KO); }
-
+// ------------------- Menu UI -------------------
 static const char* menuItems[] = {
   "Wi-Fi Scan & Connect",
   "Wi-Fi Forget",
@@ -534,16 +654,40 @@ static const char* menuItems[] = {
 };
 static int menuCount = sizeof(menuItems)/sizeof(menuItems[0]);
 static int menuIndex=0;
+
 static void drawMenu(){
+  uiInMenu = true;
   tft.fillScreen(ST77XX_BLACK); tft.setCursor(0,0);
+  tft.setTextColor(ST77XX_CYAN); tft.print("Menu");
   for (int i=0;i<menuCount;i++){
     if (i==menuIndex) tft.setTextColor(ST77XX_BLACK, ST77XX_CYAN);
     else              tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setCursor(0, i*12+10); tft.print(menuItems[i]);
+    tft.setCursor(0, i*12+14); tft.print(menuItems[i]);
   }
+  tft.setCursor(0, 14 + menuCount*12 + 4);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.print("Back = Exit");
 }
 
-// ---- Menu handlers ----
+static void exitMenuToStatus(){
+  uiInMenu = false;
+  drawStatusPage(true);
+}
+
+// ------------------- Encoder + Back button helpers -------------------
+static bool btn_last=true;
+static int8_t readEncoderStep(){
+  static uint8_t last=0;
+  uint8_t a=digitalRead(PIN_ENC_A), b=digitalRead(PIN_ENC_B), cur=(a<<1)|b;
+  int8_t s=0;
+  if((last==0&&cur==1)||(last==1&&cur==3)||(last==3&&cur==2)||(last==2&&cur==0))s=+1;
+  if((last==0&&cur==2)||(last==2&&cur==3)||(last==3&&cur==1)||(last==1&&cur==0))s=-1;
+  last=cur; return s;
+}
+static bool readButtonPressed(){ bool cur=!digitalRead(PIN_ENC_BTN); bool p=(cur && !btn_last); btn_last=cur; return p; }
+static bool readKoPressed(){ return !digitalRead(PIN_ENC_KO); }  // Physical "Back"
+
+// ------------------- Menu handlers ----
 static void startRfLearn(){
   // 6-step wizard: LEFT, RIGHT, BRAKE, TAIL, MARKER, AUX
   for (int i=0;i<R_COUNT;i++){
@@ -551,7 +695,7 @@ static void startRfLearn(){
     tft.setCursor(0,0);  tft.setTextColor(ST77XX_WHITE);
     tft.printf("Learn %s\n", RELAY_LABELS[i]);
     tft.setCursor(0,14); tft.print("Press remote button");
-    tft.setCursor(0,26); tft.print("KO = cancel");
+    tft.setCursor(0,26); tft.print("Back = cancel");
 
     uint32_t code = captureRfHashBlocking(8000);
     if (code == 0){
@@ -577,6 +721,7 @@ static void adjustOcpLimit(){
     INA226::setOcpLimit(cur);
     tft.fillScreen(ST77XX_BLACK);
     tft.setCursor(0,0); tft.printf("OCP: %.1f A\n", cur);
+    tft.setCursor(0,16); tft.setTextColor(ST77XX_YELLOW); tft.print("Back = Exit");
     delay(140);
   }
   prefs.putFloat("ocp", cur);
@@ -592,6 +737,7 @@ static void adjustBrightness(){
     ledcWrite(0, val);
     tft.fillScreen(ST77XX_BLACK);
     tft.setCursor(0,0); tft.printf("Brightness: %d\n", val);
+    tft.setCursor(0,16); tft.setTextColor(ST77XX_YELLOW); tft.print("Back = Exit");
     delay(100);
   }
   prefs.putInt("bright", val);
@@ -649,20 +795,34 @@ void setup(){
     delay(700);
   }
 
-  drawMenu();
+  // Start on Run Status page
+  drawStatusPage(true);
 }
 
 void loop(){
   int8_t step = readEncoderStep();
-  if (step){ menuIndex=(menuIndex+step+menuCount)%menuCount; drawMenu(); delay(120); }
 
-  if (readButtonPressed()){ doMenuAction(menuIndex); drawMenu(); }
-  if (readKoPressed()){ drawMenu(); } // Back/cancel refresh; (optional E-stop)
+  if (uiInMenu) {
+    if (step){ menuIndex=(menuIndex+step+menuCount)%menuCount; drawMenu(); delay(120); }
+    if (readButtonPressed()){ doMenuAction(menuIndex); drawMenu(); }
+    if (readKoPressed()){ exitMenuToStatus(); }  // Back exits menu
+  } else {
+    // On status page
+    if (readButtonPressed()){ drawMenu(); }
+    if (readKoPressed()){ drawStatusPage(true); } // Back refresh (or wire E-stop here)
+  }
 
   static int lastPos=0; int pos=readRotaryPos();
   if (pos && pos!=lastPos){ applyRotaryMode(pos); lastPos=pos; }
 
-  if (INA226::overCurrent()){ flashMode=false; relayOffAll(); buzzerAlarm(); }
+  if (INA226::overCurrent()){
+    flashMode = false;
+    RelayId culprit = currentActiveRelay();  // best guess
+    relayOffAll();
+    buzzerAlarm();
+    // Hard OCP trip = SHORT; no bypass here
+    refreshStatusIfChanged();
+  }
 
   rfService();
   serviceFlashMode();
