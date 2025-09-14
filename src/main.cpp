@@ -1,5 +1,5 @@
 // ESP32-S3 Trailer Lighting Test Box (TLTB)
-// Run Status page, interactive OPEN/SHORT popups (Back=Cancel, PUSH=Enable),
+// Run Status page, interactive OPEN/SHORT popups (Back=Cancel, OK=Enable),
 // "Back" wording, Wi-Fi scan/select/password UI, OTA (GitHub),
 // TFT + encoder + Back button, Relays with pulse-test + OCP/open/short,
 // INA226, CC1101 RF (learn 6 buttons), buzzer, NVS prefs.
@@ -43,7 +43,7 @@ static constexpr int PIN_SW_POS8 = 41;
 
 static constexpr int PIN_ENC_A   = 32;
 static constexpr int PIN_ENC_B   = 33;
-static constexpr int PIN_ENC_BTN = 25;  // encoder PUSH
+static constexpr int PIN_ENC_OK  = 25;  // encoder OK (center press)
 static constexpr int PIN_ENC_KO  = 26;  // physical Back button
 
 static constexpr int PIN_RLY_LEFT   = 11;
@@ -123,7 +123,7 @@ static RelayId currentActiveRelay(){ for(int i=0;i<R_COUNT;i++) if(relayState[i]
 
 // ------------------- Forward declarations used across sections ---
 static int8_t readEncoderStep();
-static bool   readButtonPressed();
+static bool   readOkPressed();
 static bool   readKoPressed();               // physical "Back" button
 static void   drawMenu();
 static void   drawStatusPage(bool force=false);
@@ -157,7 +157,7 @@ static void drawStatusPage(bool force){
   // Hint line
   tft.setCursor(0, 52);
   tft.setTextColor(ST77XX_YELLOW);
-  tft.print("PUSH=Menu   Back=Exit");
+  tft.print("OK=Menu   Back=Exit");
 
   _lastShownRelay = act;
   _lastShownFlash = flash;
@@ -170,7 +170,7 @@ static inline void refreshStatusIfChanged(){
 // ------------------- Fault choice popup (interactive) -------------------
 enum FaultType { FAULT_OPEN=0, FAULT_SHORT=1 };
 
-// Returns true if user presses PUSH to enable anyway, false if Back to cancel
+// Returns true if user presses OK to enable anyway, false if Back to cancel
 static bool showFaultChoicePopup(FaultType ft, RelayId r) {
   bool wasInMenu = uiInMenu;
 
@@ -197,13 +197,13 @@ static bool showFaultChoicePopup(FaultType ft, RelayId r) {
 
     tft.setCursor(0, 56);
     tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-    tft.print("PUSH = Enable");
+    tft.print("OK = Enable");
 
-    if (readButtonPressed()) {             // PUSH → enable anyway
+    if (readOkPressed()) {             // OK → enable anyway
       if (wasInMenu) drawMenu(); else drawStatusPage(true);
       return true;
     }
-    if (readKoPressed()) {                 // Back → cancel
+    if (readKoPressed()) {             // Back → cancel
       if (wasInMenu) drawMenu(); else drawStatusPage(true);
       return false;
     }
@@ -496,7 +496,7 @@ static int tftSelectFromList(const String* items, int count, const char* title) 
     // input
     int8_t step = readEncoderStep();
     if (step) idx = (idx + step + count) % count;
-    if (readButtonPressed()) return idx;
+    if (readOkPressed()) return idx;
     if (readKoPressed()) return -1;
     delay(60);
   }
@@ -550,7 +550,7 @@ static bool tftEnterPassword(char* outPass, size_t outCap, const char* ssid) {
     int8_t step = readEncoderStep();
     if (step) cur = (cur + step + total) % total;
 
-    if (readButtonPressed()) {
+    if (readOkPressed()) {
       if (cur < baseCount) {                   // append char
         if (len + 1 < outCap) { outPass[len++] = charset[cur]; outPass[len] = 0; }
       } else {
@@ -684,7 +684,7 @@ static int8_t readEncoderStep(){
   if((last==0&&cur==2)||(last==2&&cur==3)||(last==3&&cur==1)||(last==1&&cur==0))s=-1;
   last=cur; return s;
 }
-static bool readButtonPressed(){ bool cur=!digitalRead(PIN_ENC_BTN); bool p=(cur && !btn_last); btn_last=cur; return p; }
+static bool readOkPressed(){ bool cur=!digitalRead(PIN_ENC_OK); bool p=(cur && !btn_last); btn_last=cur; return p; }
 static bool readKoPressed(){ return !digitalRead(PIN_ENC_KO); }  // Physical "Back"
 
 // ------------------- Menu handlers ----
@@ -758,7 +758,7 @@ static void doMenuAction(int idx){
 // ------------------- Setup & Loop -------------------
 static void initPins(){
   pinMode(PIN_ENC_A,INPUT_PULLUP); pinMode(PIN_ENC_B,INPUT_PULLUP);
-  pinMode(PIN_ENC_BTN,INPUT_PULLUP); pinMode(PIN_ENC_KO,INPUT_PULLUP);
+  pinMode(PIN_ENC_OK,INPUT_PULLUP); pinMode(PIN_ENC_KO,INPUT_PULLUP);
   pinMode(PIN_BUZZER,OUTPUT); digitalWrite(PIN_BUZZER,LOW);
 
   pinMode(PIN_SW_POS1,INPUT_PULLUP); pinMode(PIN_SW_POS2,INPUT_PULLUP);
@@ -804,11 +804,11 @@ void loop(){
 
   if (uiInMenu) {
     if (step){ menuIndex=(menuIndex+step+menuCount)%menuCount; drawMenu(); delay(120); }
-    if (readButtonPressed()){ doMenuAction(menuIndex); drawMenu(); }
+    if (readOkPressed()){ doMenuAction(menuIndex); drawMenu(); }
     if (readKoPressed()){ exitMenuToStatus(); }  // Back exits menu
   } else {
     // On status page
-    if (readButtonPressed()){ drawMenu(); }
+    if (readOkPressed()){ drawMenu(); }
     if (readKoPressed()){ drawStatusPage(true); } // Back refresh (or wire E-stop here)
   }
 
