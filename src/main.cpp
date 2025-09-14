@@ -125,7 +125,9 @@ static RelayId currentActiveRelay(){ for(int i=0;i<R_COUNT;i++) if(relayState[i]
 static int8_t readEncoderStep();
 static bool   readOkPressed();
 static bool   readKoPressed();               // physical "Back" button
+static bool   okIsDown();
 static void   drawMenu();
+static void   scanAllRelays();
 static void   drawStatusPage(bool force=false);
 static void   refreshStatusIfChanged();
 
@@ -157,7 +159,7 @@ static void drawStatusPage(bool force){
   // Hint line
   tft.setCursor(0, 52);
   tft.setTextColor(ST77XX_YELLOW);
-  tft.print("OK=Menu   Back=Exit");
+  tft.print("OK=Menu  Hold OK=Scan  Back=Exit");
 
   _lastShownRelay = act;
   _lastShownFlash = flash;
@@ -686,8 +688,61 @@ static int8_t readEncoderStep(){
 }
 static bool readOkPressed(){ bool cur=!digitalRead(PIN_ENC_OK); bool p=(cur && !btn_last); btn_last=cur; return p; }
 static bool readKoPressed(){ return !digitalRead(PIN_ENC_KO); }  // Physical "Back"
+static bool okIsDown(){ return !digitalRead(PIN_ENC_OK); }
 
 // ------------------- Menu handlers ----
+static void scanAllRelays(){
+  // Preserve state
+  RelayId prev = currentActiveRelay();
+  bool prevFlash = flashMode; RelayId prevFlashT = flashTarget;
+  flashMode = false; relayOffAll();
+
+  enum S{S_OK=0,S_OPEN,S_SHORT};
+  S res[R_COUNT];
+
+  // Title
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setCursor(0,0); tft.setTextColor(ST77XX_CYAN); tft.print("Scanning outputs…");
+
+  for(int i=0;i<R_COUNT;i++){
+    // Pulse
+    relayOn((RelayId)i);
+    delay(PULSE_MS);
+    float ia = INA226::currentA();
+    bool ocp = INA226::overCurrent();
+    delay(POST_PULSE_MS);
+    relayOff((RelayId)i);
+
+    if (ocp || ia >= FAST_SHORT_A) res[i]=S_SHORT;
+    else if (ia < OPEN_THRESH_A)   res[i]=S_OPEN;
+    else                           res[i]=S_OK;
+
+    // Render incremental result line
+    tft.setCursor(0, 16 + i*12);
+    switch(res[i]){
+      case S_OK:   tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK); break;
+      case S_OPEN: tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK); break;
+      case S_SHORT:tft.setTextColor(ST77XX_RED, ST77XX_BLACK); break;
+    }
+    tft.printf("%-7s : %s\n", RELAY_LABELS[i], res[i]==S_OK?"OK":(res[i]==S_OPEN?"OPEN":"SHORT"));
+
+  }
+
+  tft.setCursor(0, 16 + R_COUNT*12 + 6);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.print("Back/OK = Exit");
+
+  // Wait for exit
+  while(true){
+    if (readKoPressed() || readOkPressed()) break;
+    delay(20);
+  }
+
+  // Restore previous state
+  if (prev!=R_NONE){ relayOn(prev); }
+  flashMode = prevFlash; flashTarget = prevFlashT;
+  drawStatusPage(true);
+}
 static void startRfLearn(){
   // 6-step wizard: LEFT, RIGHT, BRAKE, TAIL, MARKER, AUX
   for (int i=0;i<R_COUNT;i++){
@@ -808,6 +863,14 @@ void loop(){
     if (readKoPressed()){ exitMenuToStatus(); }  // Back exits menu
   } else {
     // On status page
+    // Long-press OK to run Scan All (hold > ~800ms)
+    static uint32_t okDownMs = 0; static bool scanning=false;
+    if (okIsDown()){
+      if (!okDownMs) okDownMs = millis();
+      if (!scanning && millis()-okDownMs > 800){ scanning=true; scanAllRelays(); }
+    } else { okDownMs = 0; scanning=false; }
+
+    // Short press still opens Menu
     if (readOkPressed()){ drawMenu(); }
     if (readKoPressed()){ drawStatusPage(true); } // Back refresh (or wire E-stop here)
   }
