@@ -2,7 +2,7 @@
 // Run Status page, interactive OPEN/SHORT popups (Back=Cancel, OK=Enable),
 // "Back" wording, Wi-Fi scan/select/password UI, OTA (GitHub),
 // TFT + encoder + Back button, Relays with pulse-test + OCP/open/short,
-// INA226, CC1101 RF (learn 6 buttons), buzzer, NVS prefs.
+// INA226 (load current), INA226 (source voltage LVP), CC1101 RF (learn 6 buttons), buzzer, NVS prefs.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -30,7 +30,8 @@ static constexpr int PIN_CC1101_GDO0 = 7;
 
 static constexpr int PIN_I2C_SDA   = 8;
 static constexpr int PIN_I2C_SCL   = 9;
-static constexpr int PIN_INA_ALERT = 16;
+static constexpr int PIN_INA_ALERT = 16;   // Load INA226 ALERT (short/OCP)
+static constexpr int PIN_INA2_ALERT = 18;  // Source INA226 ALERT (unused, but reserved)
 
 static constexpr int PIN_SW_POS1 = 34;
 static constexpr int PIN_SW_POS2 = 35;
@@ -61,11 +62,17 @@ static constexpr int PIN_BUZZER = 27;
 #endif
 
 // ------------------- INA226 Config -------------------
+// Load-side INA226 (existing)
 static float OCP_LIMIT_A   = 20.0f;     // editable via menu
 static constexpr float SHUNT_OHMS    = 0.0025f; // 2.5 mΩ (30A/75mV)
 static constexpr float CURRENT_LSB_A = 0.001f;  // 1 mA/bit
 static constexpr float FAST_SHORT_A  = 40.0f;   // instant trip
 static constexpr float OPEN_THRESH_A = 0.15f;   // open load detect
+
+// Source-side INA226 (new) for 18V battery LVP
+static float LV_CUTOFF_V = 15.5f;              // editable via menu (Milwaukee M18 under-load safe limit)
+static constexpr float LV_RELEASE_HYST_V = 1.0f; // must rise this much to clear LVP
+static bool   lvpActive = false;               // latched until release threshold
 
 // ------------------- Timings -------------------
 static constexpr uint32_t PULSE_MS        = 80;
@@ -83,6 +90,11 @@ static const char* NVS_NS = "net";
 // Wi-Fi creds in NVS
 static const char* KEY_WIFI_SSID = "wifi_ssid";
 static const char* KEY_WIFI_PASS = "wifi_pass";
+
+// Other prefs keys
+static const char* KEY_OCP       = "ocp";
+static const char* KEY_BRIGHT    = "bright";
+static const char* KEY_LV_CUTOFF = "lv_cut";
 
 // ------------------- Relay Enum -------------------
 enum RelayId { R_NONE=-1, R_LEFT, R_RIGHT, R_BRAKE, R_TAIL, R_MARKER, R_AUX, R_COUNT };
@@ -135,12 +147,15 @@ static void   refreshStatusIfChanged();
 static bool uiInMenu = false;
 static RelayId  _lastShownRelay = R_NONE;
 static bool     _lastShownFlash = false;
+static float    _lastShownSrcV  = -1.0f;
+static bool     _lastShownLvp   = false;
 
 static void drawStatusPage(bool force){
   RelayId act = currentActiveRelay();
   bool flash = flashMode;
+  float srcV = _lastShownSrcV; // default to last to avoid unnecessary I2C here; loop updates and calls refresh
 
-  if (!force && act==_lastShownRelay && flash==_lastShownFlash) return;
+  if (!force && act==_lastShownRelay && flash==_lastShownFlash && fabs(srcV-_lastShownSrcV)<0.05f && lvpActive==_lastShownLvp) return;
 
   tft.fillScreen(ST77XX_BLACK);
   tft.setCursor(0, 0);
@@ -156,13 +171,23 @@ static void drawStatusPage(bool force){
   tft.print("Flash: ");
   tft.print(flash ? "ON" : "OFF");
 
+  tft.setCursor(0, 50);
+  tft.print("SrcV: ");
+  tft.print(_lastShownSrcV, 2);
+  tft.print("V");
+
+  tft.setCursor(0, 66);
+  tft.print("LVP: ");
+  tft.print(lvpActive ? "TRIPPED" : "OK");
+
   // Hint line
-  tft.setCursor(0, 52);
+  tft.setCursor(0, 86);
   tft.setTextColor(ST77XX_YELLOW);
   tft.print("OK=Menu  Hold OK=Scan  Back=Exit");
 
   _lastShownRelay = act;
   _lastShownFlash = flash;
+  _lastShownLvp   = lvpActive;
 }
 
 static inline void refreshStatusIfChanged(){
@@ -170,7 +195,7 @@ static inline void refreshStatusIfChanged(){
 }
 
 // ------------------- Fault choice popup (interactive) -------------------
-enum FaultType { FAULT_OPEN=0, FAULT_SHORT=1 };
+enum FaultType { FAULT_OPEN=0, FAULT_SHORT=1, FAULT_LVP=2 };
 
 // Returns true if user presses OK to enable anyway, false if Back to cancel
 static bool showFaultChoicePopup(FaultType ft, RelayId r) {
@@ -183,39 +208,62 @@ static bool showFaultChoicePopup(FaultType ft, RelayId r) {
     if (ft == FAULT_OPEN) {
       tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
       tft.print("OPEN detected");
-    } else {
+    } else if (ft == FAULT_SHORT) {
       tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
       tft.print("SHORT detected");
+    } else {
+      tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+      tft.print("LOW SOURCE VOLTAGE");
     }
 
     tft.setCursor(0, 20);
     tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.print("On relay: ");
-    tft.print(relayName(r));
-
-    tft.setCursor(0, 42);
-    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-    tft.print("Back = Cancel");
-
-    tft.setCursor(0, 56);
-    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-    tft.print("OK = Enable");
-
-    if (readOkPressed()) {             // OK → enable anyway
-      if (wasInMenu) drawMenu(); else drawStatusPage(true);
-      return true;
+    if (ft == FAULT_LVP) {
+      tft.print("Battery below cutoff\nRelays disabled");
+    } else {
+      tft.print("On relay: ");
+      tft.print(relayName(r));
     }
-    if (readKoPressed()) {             // Back → cancel
-      if (wasInMenu) drawMenu(); else drawStatusPage(true);
-      return false;
+
+    if (ft == FAULT_LVP) {
+      tft.setCursor(0, 46);
+      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+      tft.printf("Raise > %.1fV to clear", LV_CUTOFF_V + LV_RELEASE_HYST_V);
+      tft.setCursor(0, 62);
+      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+      tft.print("Back = OK");
+    } else {
+      tft.setCursor(0, 42);
+      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+      tft.print("Back = Cancel");
+
+      tft.setCursor(0, 56);
+      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+      tft.print("OK = Enable");
+    }
+
+    if (ft == FAULT_LVP) {
+      if (readOkPressed() || readKoPressed()) { // single button to exit
+        if (wasInMenu) drawMenu(); else drawStatusPage(true);
+        return false;
+      }
+    } else {
+      if (readOkPressed()) {             // OK → enable anyway
+        if (wasInMenu) drawMenu(); else drawStatusPage(true);
+        return true;
+      }
+      if (readKoPressed()) {             // Back → cancel
+        if (wasInMenu) drawMenu(); else drawStatusPage(true);
+        return false;
+      }
     }
     delay(10);
   }
 }
 
-// ------------------- INA226 -------------------
+// ------------------- INA226 (Load/OCP) -------------------
 namespace INA226 {
-  static uint8_t addr = 0x40;
+  static uint8_t addr = 0x40;  // LOAD sensor at 0x40
 
   static void wr16(uint8_t r, uint16_t v){
     Wire.beginTransmission(addr); Wire.write(r);
@@ -262,8 +310,47 @@ namespace INA226 {
   }
 }
 
+// ------------------- INA226 (Source LVP) -------------------
+namespace INA226_SRC {
+  static uint8_t addr = 0x41;  // SOURCE sensor at 0x41 (wire A0 high on the second INA226)
+
+  static void wr16(uint8_t r, uint16_t v){
+    Wire.beginTransmission(addr); Wire.write(r);
+    Wire.write((uint8_t)(v>>8)); Wire.write((uint8_t)(v&0xFF));
+    Wire.endTransmission();
+  }
+  static uint16_t rd16(uint8_t r){
+    Wire.beginTransmission(addr); Wire.write(r); Wire.endTransmission(false);
+    Wire.requestFrom((int)addr,2);
+    return (Wire.read()<<8)|Wire.read();
+  }
+
+  static void begin(){
+    // Assume Wire.begin already called by INA226::begin()
+    // Reset
+    wr16(0x00, 0x8000); delay(2);
+    // Config: AVG=16, VBUSCT=1.1ms, VSHCT=1.1ms, MODE=Shunt+Bus continuous
+    wr16(0x00, (0b010<<9)|(0b100<<6)|(0b100<<3)|0b111);
+    // No calibration needed for reading VBUS
+    pinMode(PIN_INA2_ALERT, INPUT_PULLUP); // reserved
+  }
+
+  // INA226 VBUS register (0x02) LSB = 1.25mV
+  static float busVoltageV(){
+    uint16_t raw = rd16(0x02);
+    return raw * 0.00125f; // 1.25mV/LSB
+  }
+}
+
 // ------------------- Pulse Test -------------------
 static bool pulseTestAndEngage(RelayId rly) {
+  // Block if LVP is active
+  if (lvpActive) {
+    buzzerAlarm(300);
+    (void)showFaultChoicePopup(FAULT_LVP, rly);
+    return false;
+  }
+
   relayOn(rly);
   delay(PULSE_MS);
 
@@ -646,12 +733,14 @@ static esp_err_t runGithubOta(){
 
 // ------------------- Menu UI -------------------
 static const char* menuItems[] = {
-  "Wi-Fi Scan & Connect",
-  "Wi-Fi Forget",
-  "OTA Update",
+  
   "All Relays OFF",
   "Learn Remote",
   "Set OCP Limit",
+  "Set Low-Volt Cutoff",
+  "Wi-Fi Scan & Connect",
+  "Wi-Fi Forget",
+  "OTA Update",
   "Brightness"
 };
 static int menuCount = sizeof(menuItems)/sizeof(menuItems[0]);
@@ -705,6 +794,9 @@ static void scanAllRelays(){
   tft.setCursor(0,0); tft.setTextColor(ST77XX_CYAN); tft.print("Scanning outputs…");
 
   for(int i=0;i<R_COUNT;i++){
+    // Abort if LVP during scan
+    if (lvpActive) break;
+
     // Pulse
     relayOn((RelayId)i);
     delay(PULSE_MS);
@@ -730,7 +822,8 @@ static void scanAllRelays(){
 
   tft.setCursor(0, 16 + R_COUNT*12 + 6);
   tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-  tft.print("Back/OK = Exit");
+  if (lvpActive) tft.print("LVP tripped — scan aborted");
+  else           tft.print("Back/OK = Exit");
 
   // Wait for exit
   while(true){
@@ -739,7 +832,7 @@ static void scanAllRelays(){
   }
 
   // Restore previous state
-  if (prev!=R_NONE){ relayOn(prev); }
+  if (prev!=R_NONE && !lvpActive){ relayOn(prev); }
   flashMode = prevFlash; flashTarget = prevFlashT;
   drawStatusPage(true);
 }
@@ -779,11 +872,27 @@ static void adjustOcpLimit(){
     tft.setCursor(0,16); tft.setTextColor(ST77XX_YELLOW); tft.print("Back = Exit");
     delay(140);
   }
-  prefs.putFloat("ocp", cur);
+  prefs.putFloat(KEY_OCP, cur);
+}
+
+static void adjustLvCutoff(){
+  float cur = LV_CUTOFF_V;
+  while (!readKoPressed()){
+    int8_t s = readEncoderStep();
+    if (s) cur += s * 0.1f;           // 0.1 V steps
+    cur = max(12.0f, min(cur, 18.0f));
+    LV_CUTOFF_V = cur; // live update affects lvp logic immediately
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setCursor(0,0); tft.printf("LVP cutoff: %.1f V\n", cur);
+    tft.setCursor(0,14); tft.printf("Release at: %.1f V\n", cur + LV_RELEASE_HYST_V);
+    tft.setCursor(0,30); tft.setTextColor(ST77XX_YELLOW); tft.print("Back = Save/Exit");
+    delay(120);
+  }
+  prefs.putFloat(KEY_LV_CUTOFF, cur);
 }
 
 static void adjustBrightness(){
-  int val = prefs.getInt("bright", 200);
+  int val = prefs.getInt(KEY_BRIGHT, 200);
   ledcAttachPin(PIN_TFT_BL, 0); ledcSetup(0, 5000, 8);
   while (!readKoPressed()){
     int8_t s = readEncoderStep();
@@ -795,7 +904,7 @@ static void adjustBrightness(){
     tft.setCursor(0,16); tft.setTextColor(ST77XX_YELLOW); tft.print("Back = Exit");
     delay(100);
   }
-  prefs.putInt("bright", val);
+  prefs.putInt(KEY_BRIGHT, val);
 }
 
 static void doMenuAction(int idx){
@@ -806,7 +915,37 @@ static void doMenuAction(int idx){
     case 3: relayOffAll(); flashMode=false; break;
     case 4: startRfLearn(); break;
     case 5: adjustOcpLimit(); break;
-    case 6: adjustBrightness(); break;
+    case 6: adjustLvCutoff(); break;
+    case 7: adjustBrightness(); break;
+  }
+}
+
+// ------------------- LVP service -------------------
+static float SRC_V = 0.0f;  // most recent source voltage reading
+
+static void lvpService(){
+  static uint32_t last=0;
+  if (millis()-last < 100) return; // ~10Hz
+  last = millis();
+
+  SRC_V = INA226_SRC::busVoltageV();
+
+  // Hysteresis: trip below cutoff, release when above cutoff + hysteresis
+  if (!lvpActive && SRC_V > 0 && SRC_V < LV_CUTOFF_V) {
+    lvpActive = true;
+    flashMode = false;
+    relayOffAll();
+    buzzerAlarm(300);
+  } else if (lvpActive && SRC_V >= (LV_CUTOFF_V + LV_RELEASE_HYST_V)) {
+    lvpActive = false;
+    buzzerBeep(80);
+  }
+
+  // push to status page cache for redraw
+  if (fabs(SRC_V - _lastShownSrcV) > 0.05f || _lastShownLvp != lvpActive) {
+    _lastShownSrcV = SRC_V;
+    _lastShownLvp  = lvpActive;
+    refreshStatusIfChanged();
   }
 }
 
@@ -834,12 +973,14 @@ void setup(){
 
   initPins();
   INA226::begin();
+  INA226_SRC::begin();
   rfInit();
 
-  // Restore saved OCP / brightness on boot
-  float ocp = prefs.getFloat("ocp", OCP_LIMIT_A);
+  // Restore saved OCP / LVP / brightness on boot
+  float ocp = prefs.getFloat(KEY_OCP, OCP_LIMIT_A);
   INA226::setOcpLimit(ocp);
-  int bright = prefs.getInt("bright", 255);
+  LV_CUTOFF_V = prefs.getFloat(KEY_LV_CUTOFF, LV_CUTOFF_V);
+  int bright = prefs.getInt(KEY_BRIGHT, 255);
   ledcAttachPin(PIN_TFT_BL, 0); ledcSetup(0, 5000, 8); ledcWrite(0, bright);
 
   // Auto-connect Wi-Fi if saved
@@ -851,6 +992,7 @@ void setup(){
   }
 
   // Start on Run Status page
+  _lastShownSrcV = INA226_SRC::busVoltageV();
   drawStatusPage(true);
 }
 
@@ -878,14 +1020,19 @@ void loop(){
   static int lastPos=0; int pos=readRotaryPos();
   if (pos && pos!=lastPos){ applyRotaryMode(pos); lastPos=pos; }
 
+  // Hard OCP trip
   if (INA226::overCurrent()){
     flashMode = false;
-    RelayId culprit = currentActiveRelay();  // best guess
+    RelayId culprit = currentActiveRelay(); // best guess
+    (void)culprit;
     relayOffAll();
     buzzerAlarm();
     // Hard OCP trip = SHORT; no bypass here
     refreshStatusIfChanged();
   }
+
+  // Low Voltage Protection service
+  lvpService();
 
   rfService();
   serviceFlashMode();
