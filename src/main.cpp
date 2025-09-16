@@ -149,13 +149,15 @@ static RelayId  _lastShownRelay = R_NONE;
 static bool     _lastShownFlash = false;
 static float    _lastShownSrcV  = -1.0f;
 static bool     _lastShownLvp   = false;
+static float    _lastShownLoadA = -1.0f;
 
 static void drawStatusPage(bool force){
   RelayId act = currentActiveRelay();
   bool flash = flashMode;
-  float srcV = _lastShownSrcV; // default to last to avoid unnecessary I2C here; loop updates and calls refresh
+  float srcV = _lastShownSrcV;
+  float loadA = _lastShownLoadA;
 
-  if (!force && act==_lastShownRelay && flash==_lastShownFlash && fabs(srcV-_lastShownSrcV)<0.05f && lvpActive==_lastShownLvp) return;
+  if (!force && act==_lastShownRelay && flash==_lastShownFlash && fabs(srcV-_lastShownSrcV)<0.05f && fabs(loadA-_lastShownLoadA)<0.05f && lvpActive==_lastShownLvp) return;
 
   tft.fillScreen(ST77XX_BLACK);
   tft.setCursor(0, 0);
@@ -180,85 +182,24 @@ static void drawStatusPage(bool force){
   tft.print("LVP: ");
   tft.print(lvpActive ? "TRIPPED" : "OK");
 
+  tft.setCursor(0, 82);
+  tft.print("Load: ");
+  tft.print(_lastShownLoadA, 2);
+  tft.print("A");
+
   // Hint line
-  tft.setCursor(0, 86);
+  tft.setCursor(0, 98);
   tft.setTextColor(ST77XX_YELLOW);
   tft.print("OK=Menu  Hold OK=Scan  Back=Exit");
 
   _lastShownRelay = act;
   _lastShownFlash = flash;
   _lastShownLvp   = lvpActive;
+  _lastShownLoadA = loadA;
 }
 
 static inline void refreshStatusIfChanged(){
   if (!uiInMenu) drawStatusPage(false);
-}
-
-// ------------------- Fault choice popup (interactive) -------------------
-enum FaultType { FAULT_OPEN=0, FAULT_SHORT=1, FAULT_LVP=2 };
-
-// Returns true if user presses OK to enable anyway, false if Back to cancel
-static bool showFaultChoicePopup(FaultType ft, RelayId r) {
-  bool wasInMenu = uiInMenu;
-
-  for (;;) {
-    tft.fillScreen(ST77XX_BLACK);
-    tft.setCursor(0, 0);
-
-    if (ft == FAULT_OPEN) {
-      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-      tft.print("OPEN detected");
-    } else if (ft == FAULT_SHORT) {
-      tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
-      tft.print("SHORT detected");
-    } else {
-      tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
-      tft.print("LOW SOURCE VOLTAGE");
-    }
-
-    tft.setCursor(0, 20);
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    if (ft == FAULT_LVP) {
-      tft.print("Battery below cutoff\nRelays disabled");
-    } else {
-      tft.print("On relay: ");
-      tft.print(relayName(r));
-    }
-
-    if (ft == FAULT_LVP) {
-      tft.setCursor(0, 46);
-      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-      tft.printf("Raise > %.1fV to clear", LV_CUTOFF_V + LV_RELEASE_HYST_V);
-      tft.setCursor(0, 62);
-      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-      tft.print("Back = OK");
-    } else {
-      tft.setCursor(0, 42);
-      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-      tft.print("Back = Cancel");
-
-      tft.setCursor(0, 56);
-      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-      tft.print("OK = Enable");
-    }
-
-    if (ft == FAULT_LVP) {
-      if (readOkPressed() || readKoPressed()) { // single button to exit
-        if (wasInMenu) drawMenu(); else drawStatusPage(true);
-        return false;
-      }
-    } else {
-      if (readOkPressed()) {             // OK → enable anyway
-        if (wasInMenu) drawMenu(); else drawStatusPage(true);
-        return true;
-      }
-      if (readKoPressed()) {             // Back → cancel
-        if (wasInMenu) drawMenu(); else drawStatusPage(true);
-        return false;
-      }
-    }
-    delay(10);
-  }
 }
 
 // ------------------- INA226 (Load/OCP) -------------------
@@ -341,6 +282,10 @@ namespace INA226_SRC {
     return raw * 0.00125f; // 1.25mV/LSB
   }
 }
+
+// ------------------- Fault popup forward declarations (needed by pulseTest) -------------------
+enum FaultType { FAULT_OPEN=0, FAULT_SHORT=1, FAULT_LVP=2 };
+static bool showFaultChoicePopup(FaultType ft, RelayId r);
 
 // ------------------- Pulse Test -------------------
 static bool pulseTestAndEngage(RelayId rly) {
@@ -735,13 +680,14 @@ static esp_err_t runGithubOta(){
 static const char* menuItems[] = {
   
   "All Relays OFF",
-  "Learn Remote",
   "Set OCP Limit",
   "Set Low-Volt Cutoff",
+  "Learn Remote",
+  "Brightness",
   "Wi-Fi Scan & Connect",
   "Wi-Fi Forget",
   "OTA Update",
-  "Brightness"
+  
 };
 static int menuCount = sizeof(menuItems)/sizeof(menuItems[0]);
 static int menuIndex=0;
@@ -778,6 +724,73 @@ static int8_t readEncoderStep(){
 static bool readOkPressed(){ bool cur=!digitalRead(PIN_ENC_OK); bool p=(cur && !btn_last); btn_last=cur; return p; }
 static bool readKoPressed(){ return !digitalRead(PIN_ENC_KO); }  // Physical "Back"
 static bool okIsDown(){ return !digitalRead(PIN_ENC_OK); }
+
+// ------------------- Fault choice popup (interactive) -------------------
+
+
+// Returns true if user presses OK to enable anyway, false if Back to cancel
+static bool showFaultChoicePopup(FaultType ft, RelayId r) {
+  bool wasInMenu = uiInMenu;
+
+  for (;;) {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setCursor(0, 0);
+
+    if (ft == FAULT_OPEN) {
+      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+      tft.print("OPEN detected");
+    } else if (ft == FAULT_SHORT) {
+      tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+      tft.print("SHORT detected");
+    } else {
+      tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+      tft.print("LOW SOURCE VOLTAGE");
+    }
+
+    tft.setCursor(0, 20);
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    if (ft == FAULT_LVP) {
+      tft.print("Battery below cutoff\nRelays disabled");
+    } else {
+      tft.print("On relay: ");
+      tft.print(relayName(r));
+    }
+
+    if (ft == FAULT_LVP) {
+      tft.setCursor(0, 46);
+      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+      tft.printf("Raise > %.1fV to clear", LV_CUTOFF_V + LV_RELEASE_HYST_V);
+      tft.setCursor(0, 62);
+      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+      tft.print("Back = OK");
+    } else {
+      tft.setCursor(0, 42);
+      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+      tft.print("Back = Cancel");
+
+      tft.setCursor(0, 56);
+      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+      tft.print("OK = Enable");
+    }
+
+    if (ft == FAULT_LVP) {
+      if (readOkPressed() || readKoPressed()) { // single button to exit
+        if (wasInMenu) drawMenu(); else drawStatusPage(true);
+        return false;
+      }
+    } else {
+      if (readOkPressed()) {             // OK → enable anyway
+        if (wasInMenu) drawMenu(); else drawStatusPage(true);
+        return true;
+      }
+      if (readKoPressed()) {             // Back → cancel
+        if (wasInMenu) drawMenu(); else drawStatusPage(true);
+        return false;
+      }
+    }
+    delay(10);
+  }
+}
 
 // ------------------- Menu handlers ----
 static void scanAllRelays(){
@@ -920,6 +933,20 @@ static void doMenuAction(int idx){
   }
 }
 
+// ------------------- Telemetry (SrcV + LoadA) -------------------
+static void telemetryService(){
+  static uint32_t last=0;
+  if (millis()-last < 200) return; // 5 Hz
+  last = millis();
+
+  float newV = INA226_SRC::busVoltageV();
+  float newI = INA226::currentA();
+  bool changed=false;
+  if (fabs(newV - _lastShownSrcV) > 0.05f) { _lastShownSrcV = newV; changed=true; }
+  if (fabs(newI - _lastShownLoadA) > 0.05f) { _lastShownLoadA = newI; changed=true; }
+  if (changed && !uiInMenu) drawStatusPage(true);
+}
+
 // ------------------- LVP service -------------------
 static float SRC_V = 0.0f;  // most recent source voltage reading
 
@@ -993,6 +1020,7 @@ void setup(){
 
   // Start on Run Status page
   _lastShownSrcV = INA226_SRC::busVoltageV();
+  _lastShownLoadA = INA226::currentA();
   drawStatusPage(true);
 }
 
@@ -1033,6 +1061,8 @@ void loop(){
 
   // Low Voltage Protection service
   lvpService();
+  // Telemetry for run page (SrcV + LoadA)
+  telemetryService();
 
   rfService();
   serviceFlashMode();
